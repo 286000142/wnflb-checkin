@@ -29,6 +29,7 @@ import os
 import re
 import sys
 import time
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -328,8 +329,7 @@ def verify_captcha_code(session, cap, code):
 
 
 def _submit_login(session, formhash, loginhash, username="", password="",
-                  seccode="", auth="", seccodehash="", challenge=False,
-                  include_creds=False):
+                  seccode="", auth="", seccodehash="", challenge=False):
     """
     执行一次登录 POST。返回 (ok, msg, resp_html)。
 
@@ -338,7 +338,8 @@ def _submit_login(session, formhash, loginhash, username="", password="",
       - 字段集对齐浏览器真实成功包：formhash/referer/auth/questionid/answer/
         seccodehash/seccodemodid=member::logging/seccodeverify
       - 登录 URL 带 &inajax=1
-    include_creds=True 时（挑战提交的兜底）额外带上 username/password。
+      - auth 调用方需先用 urllib.parse.unquote 还原，再由本函数统一按
+        form-urlencoded 编码（与浏览器/真实 curl 字节级一致）
     """
     if challenge:
         data = {
@@ -351,10 +352,6 @@ def _submit_login(session, formhash, loginhash, username="", password="",
             "seccodemodid": "member::logging",
             "seccodeverify": seccode,
         }
-        if include_creds:
-            data["loginfield"] = "username"
-            data["username"] = username
-            data["password"] = password
     else:
         data = {
             "formhash": formhash,
@@ -427,17 +424,20 @@ def do_login(session, username, password):
     if ok:
         return True, msg
 
-    # 被验证码挑战：从第一次提交的响应里直接解析挑战页（auth 由本次响应给出，
-    # 不要再额外 GET 一次，否则 auth 可能失效）。
+    # 被验证码挑战：从第一次提交的响应里直接解析挑战页（auth 由本次响应给出）。
+    # 关键：auth 在 HTML 里可能以 %2F 形式存在（含 /），需先 unquote 还原，
+    # 再交给 _submit_login 统一按 form-urlencoded 编码，否则会被二次编码导致
+    # 服务端认不出令牌、报“密码空或包含非法字符”。
     chtml = resp_html or ""
     c_fh, c_lh, auth = extract_login_fields(chtml)
+    auth = urllib.parse.unquote(auth) if auth else None
     if not auth:
-        am = re.search(r"auth=([A-Za-z0-9%_]+)", chtml)
-        auth = am.group(1) if am else None
+        am = re.search(r"auth=([A-Za-z0-9%_./]+)", chtml)
+        auth = urllib.parse.unquote(am.group(1)) if am else None
     if not auth:
         return False, msg  # 真失败（密码错等），msg 已是原因
 
-    # 若挑战页字段没解析全，带 auth 重新拉一次，并从页面里取最新的 auth
+    # 若挑战页字段没解析全，带 auth 重新拉一次，并从页面里取最新的 auth（同样 unquote）
     cap = detect_captcha(chtml)
     if not (c_fh and c_lh and cap["needed"] and cap["idhash"]):
         print("  [登录] 触发验证码挑战，重新获取挑战页 ...")
@@ -449,8 +449,7 @@ def do_login(session, username, password):
             )
             chtml = get_page_text(r)
             c_fh, c_lh, c_auth = extract_login_fields(chtml)
-            if c_auth:
-                auth = c_auth
+            auth = urllib.parse.unquote(c_auth) if c_auth else auth
             cap = detect_captcha(chtml)
         except requests.RequestException as e:
             return False, f"获取挑战页异常: {e}"
@@ -460,9 +459,9 @@ def do_login(session, username, password):
     if not cap["needed"] or not cap["idhash"]:
         return False, f"验证码挑战页未解析出验证码(idhash 缺失): {msg}"
 
-    # 二次提交：先校验验证码（action=check 写 seccode cookie）-> 带 auth 提交
-    # （不带账号密码，凭据由 auth 关联；若因凭据缺失失败则带凭据兜底重试一次）
-    msg2 = "验证码识别失败"
+    # 二次挑战提交（不带账号密码，凭据由 auth 关联）。最多 3 次换图重试；
+    # 若仍报凭据缺失（auth 失效 / 编码问题），则重拉挑战页拿新 auth 再试。
+    last_msg = "验证码识别失败"
     for attempt in range(1, 4):
         print(f"  [登录] 验证码 idhash={cap['idhash']}，ddddocr 识别中(第{attempt}次) ...")
         code = solve_captcha(session, cap)
@@ -470,33 +469,38 @@ def do_login(session, username, password):
             return False, "验证码识别失败，请检查 ddddocr 或手动处理"
 
         # 调用验证码校验接口（设置 seccode cookie，确认识别是否正确）
-        vok = verify_captcha_code(session, cap, code)
-        if not vok:
+        if not verify_captcha_code(session, cap, code):
             print(f"  [登录] 第 {attempt} 次验证码校验未通过，换新图重试 ...")
             continue
 
-        ok2, msg2, _ = _submit_login(
+        ok2, last_msg, _ = _submit_login(
             session, c_fh, c_lh, username, password, code, auth,
             cap["seccodehash"], challenge=True,
         )
         if ok2:
-            return True, (msg2 or "登录成功(已通过验证码)")
+            return True, (last_msg or "登录成功(已通过验证码)")
         # 验证码不正确则换新图重试
-        if "验证码" in msg2 and ("不正确" in msg2 or "错误" in msg2):
+        if "验证码" in last_msg and ("不正确" in last_msg or "错误" in last_msg):
             print(f"  [登录] 第 {attempt} 次验证码不正确，换新图重试 ...")
             continue
-        # 若因凭据缺失失败（如"密码空"），带账号密码兜底重试一次
-        if "密码" in msg2 or "用户名" in msg2:
-            print(f"  [登录] 第 {attempt} 次疑似凭据缺失，带账号密码兜底重试 ...")
-            ok2, msg2, _ = _submit_login(
-                session, c_fh, c_lh, username, password, code, auth,
-                cap["seccodehash"], challenge=True, include_creds=True,
-            )
-            if ok2:
-                return True, (msg2 or "登录成功(已通过验证码)")
+        # 凭据缺失（auth 失效）：重拉挑战页获取新 auth 重试一次
+        if "密码" in last_msg or "用户名" in last_msg:
+            print(f"  [登录] 第 {attempt} 次疑似凭据缺失，重拉挑战页重试 ...")
+            try:
+                r = session.get(
+                    f"{BASE_URL}/member.php?mod=logging&action=login&auth={auth}",
+                    timeout=TIMEOUT, headers={"Referer": LOGIN_PAGE_URL},
+                )
+                chtml = get_page_text(r)
+                c_fh, c_lh, c_auth = extract_login_fields(chtml)
+                auth = urllib.parse.unquote(c_auth) if c_auth else auth
+                cap = detect_captcha(chtml)
+            except requests.RequestException:
+                pass
+            continue
         # 其他失败不再重试
-        return False, msg2
-    return False, msg2
+        return False, last_msg
+    return False, last_msg
 
 
 # ========================= 签到 =========================
