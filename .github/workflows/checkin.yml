@@ -1,0 +1,51 @@
+name: 福利吧自动签到
+
+on:
+  schedule:
+    # 北京时间 09:00 与 22:00（对应 UTC 01:00 / 14:00）
+    - cron: "0 1,14 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 恢复 Cookie 缓存
+        uses: actions/download-artifact@v4
+        with:
+          name: wnflb-cookies
+          path: .
+        continue-on-error: true
+
+      - name: 执行签到
+        env:
+          FORUM_USERNAME: ${{ secrets.FORUM_USERNAME }}
+          FORUM_PASSWORD: ${{ secrets.FORUM_PASSWORD }}
+          FORUM_COOKIE: ${{ secrets.FORUM_COOKIE }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+        run: python wnflb_checkin.py
+
+      - name: 保存 Cookie 缓存
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wnflb-cookies
+          path: cookies.json
+          overwrite: true
+          if-no-files-found: warn
