@@ -205,12 +205,12 @@ def detect_captcha(html):
     }
 
     # auth 令牌（二次挑战，必须随登录一起提交）
-    am = re.search(r'name="auth"\s+value="([A-Za-z0-9%_]+)"', html)
+    am = re.search(r'name="auth"\s+value="([A-Za-z0-9%_./=+]+)"', html)
     if am:
         res["auth"] = am.group(1)
 
     # idhash：优先 updateseccode('IDHASH', ...) 或 <span id="seccode_IDHASH">
-    ih = re.search(r"updateseccode\(\s*'([A-Za-z0-9]+)'", html)
+    ih = re.search(r"updateseccode\(\s*['\"]([A-Za-z0-9]+)['\"]", html)
     if not ih:
         ih = re.search(r'id="seccode_([A-Za-z0-9]+)"', html)
     if not ih:
@@ -432,7 +432,7 @@ def do_login(session, username, password):
     c_fh, c_lh, auth = extract_login_fields(chtml)
     auth = urllib.parse.unquote(auth) if auth else None
     if not auth:
-        am = re.search(r"auth=([A-Za-z0-9%_./]+)", chtml)
+        am = re.search(r"auth=([A-Za-z0-9%_./=+]+)", chtml)
         auth = urllib.parse.unquote(am.group(1)) if am else None
     if not auth:
         return False, msg  # 真失败（密码错等），msg 已是原因
@@ -443,7 +443,8 @@ def do_login(session, username, password):
         print("  [登录] 触发验证码挑战，重新获取挑战页 ...")
         try:
             r = session.get(
-                f"{BASE_URL}/member.php?mod=logging&action=login&auth={auth}",
+                f"{BASE_URL}/member.php",
+                params={"mod": "logging", "action": "login", "auth": auth},
                 timeout=TIMEOUT,
                 headers={"Referer": LOGIN_PAGE_URL},
             )
@@ -457,6 +458,13 @@ def do_login(session, username, password):
     if not (c_fh and c_lh):
         return False, "验证码挑战页未解析出 formhash/loginhash"
     if not cap["needed"] or not cap["idhash"]:
+        # 调试：把挑战页里和验证码相关的片段打出来，便于排查页面结构变化
+        dbg = re.findall(r".{0,40}seccode.{0,60}", chtml, re.I)
+        if not dbg:
+            dbg = re.findall(r".{0,30}updateseccode.{0,60}", chtml, re.I)
+        print("  [调试] 挑战页未匹配到 seccode 标记，相关片段:")
+        for d in dbg[:5]:
+            print("    ", d.strip()[:120])
         return False, f"验证码挑战页未解析出验证码(idhash 缺失): {msg}"
 
     # 二次挑战提交（不带账号密码，凭据由 auth 关联）。最多 3 次换图重试；
@@ -488,7 +496,8 @@ def do_login(session, username, password):
             print(f"  [登录] 第 {attempt} 次疑似凭据缺失，重拉挑战页重试 ...")
             try:
                 r = session.get(
-                    f"{BASE_URL}/member.php?mod=logging&action=login&auth={auth}",
+                    f"{BASE_URL}/member.php",
+                    params={"mod": "logging", "action": "login", "auth": auth},
                     timeout=TIMEOUT, headers={"Referer": LOGIN_PAGE_URL},
                 )
                 chtml = get_page_text(r)
