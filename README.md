@@ -45,11 +45,13 @@
    - `PUSHPLUS_TOKEN` / `SERVERCHAN_KEY`：（可选）微信推送通知
 3. 进入 `Actions` 标签页，手动 **Run workflow** 跑一次验证；之后会按 cron
    （北京时间 09:00 / 22:00）自动运行。
-4. Cookie 会通过 **Artifacts（名为 `wnflb-cookies`）** 在每次运行间缓存：
-   有效就直接签到，过期才用账号密码重新登录。
+4. **Cookie 通过 GitHub Cache 跨运行持久化**：首次运行走账号密码+验证码登录，
+   成功后 Cookie 经 `actions/cache` 缓存；之后的运行自动恢复复用，**跳过登录与验证码**直接签到。
+   Cookie 过期（或 Cache 超过保留期被清理）时，脚本会检测失效并自动重新登录一次。
 
-> ⚠️ GitHub 的运行机 IP 每次可能变化，因此 Actions 里**每次cookie过期登录都要识别一次验证码**，
-> 本地（固定 IP）则登录一次后长期复用 Cookie。若 Actions 提示连不上论坛（GFW/网络原因），
+> ⚠️ 论坛 Cookie **不与登录 IP 绑定**，因此 Cache 缓存可正常跨运行复用，避免每次都识别验证码。
+> 注意：`upload/download-artifact@v4` 默认只在同一 workflow run 内生效、**无法跨 run 复用**，故此处改用 `actions/cache`（支持跨运行命中）。
+> 本地（固定 IP）运行同样由 `cookies.json` 复用。若 Actions 连不上论坛（GFW/网络原因），
 > 可改用本地运行或自建国内 runner。
 
 ---

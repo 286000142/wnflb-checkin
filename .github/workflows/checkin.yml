@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  actions: write   # actions/cache 保存缓存需要写权限
 
 jobs:
   checkin:
@@ -26,11 +27,14 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: 恢复 Cookie 缓存
-        uses: actions/download-artifact@v4
+        uses: actions/cache@v4
         with:
-          name: wnflb-cookies
-          path: .
-        continue-on-error: true
+          path: cookies.json
+          # 用 run_id 作 key，每次都是新 key → 结束时 cache 的 save 步骤总会写入最新 cookie
+          # restore-keys 用前缀匹配，自动恢复上一次 run 缓存的 cookie（跨 run 复用）
+          key: wnflb-cookies-${{ github.run_id }}
+          restore-keys: |
+            wnflb-cookies-
 
       - name: 执行签到
         env:
@@ -40,12 +44,3 @@ jobs:
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
         run: python wnflb_checkin.py
-
-      - name: 保存 Cookie 缓存
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: wnflb-cookies
-          path: cookies.json
-          overwrite: true
-          if-no-files-found: warn
