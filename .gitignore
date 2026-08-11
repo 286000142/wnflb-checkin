@@ -1,0 +1,16 @@
+﻿# 运行时生成的登录态缓存（含会话 cookie，勿提交）
+cookies.json
+cookies_test.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 系统/编辑器
+.DS_Store
+*.log
+
+# 本地记忆/身份（含工作记录，勿提交到公开仓库）
+.workbuddy/
