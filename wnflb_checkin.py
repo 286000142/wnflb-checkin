@@ -188,50 +188,74 @@ def fetch_login_page(session):
 
 def detect_captcha(html):
     """
-    识别登录页是否需要验证码。
-    Discuz 验证码图片地址形如：
-      misc.php?mod=seccode&update=<rand>&idhash=<hash>
-    返回 dict: {needed, idhash, update, seccodehash}
+    识别登录页/挑战页是否需要验证码，并提取关键参数。
+    支持两种形态：
+      A. 标准：misc.php?mod=seccode&update=<rand>&idhash=<hash>
+      B. 二次挑战（新 IP）：响应带 name="auth" 令牌
+         + updateseccode('IDHASH', ...) / <span id="seccode_IDHASH">
+    返回 dict: {needed, idhash, update, seccodehash, auth}
     """
-    idhash = ""
-    update = str(int(time.time() * 1000))
+    res = {
+        "needed": False,
+        "idhash": "",
+        "update": str(int(time.time() * 1000)),
+        "seccodehash": "",
+        "auth": "",
+    }
 
-    # 方式1：验证码图片地址 misc.php?mod=seccode&update=..&idhash=..
-    m = re.search(
-        r"misc\.php\?mod=seccode&update=([^&\"']+)&idhash=([A-Za-z0-9]+)",
-        html,
-    )
-    if m:
-        idhash = m.group(2)
-        update = m.group(1)
+    # auth 令牌（二次挑战，必须随登录一起提交）
+    am = re.search(r'name="auth"\s+value="([A-Za-z0-9%_]+)"', html)
+    if am:
+        res["auth"] = am.group(1)
 
-    # 方式2：输入框 id 形如 seccodeverify_<idhash>
-    if not idhash:
+    # idhash：优先 updateseccode('IDHASH', ...) 或 <span id="seccode_IDHASH">
+    ih = re.search(r"updateseccode\(\s*'([A-Za-z0-9]+)'", html)
+    if not ih:
+        ih = re.search(r'id="seccode_([A-Za-z0-9]+)"', html)
+    if not ih:
+        sm = re.search(
+            r"misc\.php\?mod=seccode&update=([^&\"']+)&idhash=([A-Za-z0-9]+)", html
+        )
+        if sm:
+            res["idhash"] = sm.group(2)
+            res["update"] = sm.group(1)
+    if ih and not res["idhash"]:
+        res["idhash"] = ih.group(1)
+
+    # 输入框 id 形如 seccodeverify_<idhash>
+    if not res["idhash"]:
         sid = re.search(r'id="seccodeverify_([A-Za-z0-9]+)"', html)
         if sid:
-            idhash = sid.group(1)
-
-    # 方式3：隐藏域 seccodehash
-    if not idhash:
+            res["idhash"] = sid.group(1)
+    # 隐藏域 seccodehash
+    if not res["idhash"]:
         sh = re.search(r'name="seccodehash"\s+value="([A-Za-z0-9]+)"', html)
         if sh:
-            idhash = sh.group(1)
+            res["idhash"] = sh.group(1)
 
-    # 只要出现验证码输入框，就认为需要验证码
-    if not idhash:
-        if re.search(r'name="seccodeverify"', html):
-            idhash = "SkyV"  # 极端兜底
-        else:
-            return {"needed": False, "idhash": "", "update": "", "seccodehash": ""}
+    if not res["idhash"] and re.search(r'name="seccodeverify"', html):
+        res["idhash"] = "SkyV"  # 极端兜底
 
-    sh = re.search(r'name="seccodehash"\s+value="([A-Za-z0-9]+)"', html)
-    seccodehash = sh.group(1) if sh else idhash
-    return {
-        "needed": True,
-        "idhash": idhash,
-        "update": update,
-        "seccodehash": seccodehash,
-    }
+    if res["idhash"] or res["auth"]:
+        res["needed"] = True
+
+    if res["idhash"]:
+        sh = re.search(r'name="seccodehash"\s+value="([A-Za-z0-9]+)"', html)
+        res["seccodehash"] = sh.group(1) if sh else res["idhash"]
+
+    return res
+
+
+def extract_login_fields(html):
+    """从登录/挑战页提取 formhash、loginhash、auth（用于二次提交）。"""
+    fh = re.search(r'name="formhash"\s+value="([a-f0-9]+)"', html)
+    lh = re.search(r"loginhash=([A-Za-z0-9]+)", html)
+    auth = re.search(r'name="auth"\s+value="([A-Za-z0-9%_]+)"', html)
+    return (
+        fh.group(1) if fh else None,
+        lh.group(1) if lh else None,
+        auth.group(1) if auth else None,
+    )
 
 
 def solve_captcha(session, cap):
@@ -247,6 +271,8 @@ def solve_captcha(session, cap):
         return None
 
     ocr = ddddocr.DdddOcr(show_ad=False)
+    # 论坛/WAF 对 seccode 图片接口要求同源 Referer，否则返回 Access Denied
+    headers = {"Referer": LOGIN_PAGE_URL}
     for attempt in range(1, 4):
         try:
             update = str(int(time.time() * 1000))
@@ -254,9 +280,13 @@ def solve_captcha(session, cap):
                 f"{BASE_URL}/misc.php?mod=seccode"
                 f"&update={update}&idhash={cap['idhash']}"
             )
-            r = session.get(img_url, timeout=TIMEOUT)
-            if r.status_code != 200 or not r.content:
-                print(f"  [验证码] 第 {attempt} 次拉取图片失败")
+            r = session.get(img_url, timeout=TIMEOUT, headers=headers)
+            # 校验确实是图片（PNG/JPEG 魔数），避免把 Access Denied 当图片识别
+            if r.status_code != 200 or len(r.content) < 100:
+                print(f"  [验证码] 第 {attempt} 次拉取图片失败(status={r.status_code}, len={len(r.content)})")
+                continue
+            if r.content[:4] not in (b"\x89PNG", b"\xff\xd8\xff\xe0", b"\xff\xd8\xff\xe1"):
+                print(f"  [验证码] 第 {attempt} 次返回非图片(可能被拦截), len={len(r.content)}")
                 continue
             code = ocr.classification(r.content).strip()
             print(f"  [验证码] 第 {attempt} 次识别结果: {code!r}")
@@ -267,16 +297,9 @@ def solve_captcha(session, cap):
     return None
 
 
-def do_login(session, username, password):
-    """
-    账号密码登录。成功返回 (True, 消息)，失败返回 (False, 消息)。
-    """
-    print("  [登录] 获取登录页 ...")
-    html, formhash, loginhash = fetch_login_page(session)
-    if not formhash or not loginhash:
-        return False, "无法解析登录页(formhash/loginhash 缺失)"
-
-    cap = detect_captcha(html)
+def _submit_login(session, formhash, loginhash, username, password,
+                  seccode, auth, seccodehash=""):
+    """执行一次登录 POST。返回 (ok, msg, resp_html)。"""
     data = {
         "formhash": formhash,
         "referer": BASE_URL + "/",
@@ -287,20 +310,17 @@ def do_login(session, username, password):
         "answer": "",
         "cookietime": "2592000",
     }
-
-    if cap["needed"]:
-        print("  [登录] 检测到验证码，开始识别 ...")
-        code = solve_captcha(session, cap)
-        if not code:
-            return False, "验证码识别失败，请检查 ddddocr 或手动处理"
-        data["seccodeverify"] = code
-        data["seccodehash"] = cap["seccodehash"]
+    if seccode:
+        data["seccodeverify"] = seccode
+        if seccodehash:
+            data["seccodehash"] = seccodehash
+    if auth:
+        data["auth"] = auth
 
     login_url = (
         f"{BASE_URL}/member.php?mod=logging&action=login"
         f"&loginsubmit=yes&loginhash={loginhash}"
     )
-    print("  [登录] 提交登录请求 ...")
     try:
         r = session.post(
             login_url,
@@ -310,26 +330,88 @@ def do_login(session, username, password):
             headers={"Referer": LOGIN_PAGE_URL},
         )
     except requests.RequestException as e:
-        return False, f"登录请求异常: {e}"
+        return False, f"登录请求异常: {e}", ""
 
     txt = get_page_text(r)
     msg = extract_message(txt)
 
-    # 失败关键词（提前拦截，避免被误判成成功）
-    if "验证码" in txt and "错误" in txt:
-        return False, "验证码不正确，请重试"
-    if "密码错误" in txt or "用户名或密码" in txt or "密码" in txt and "错误" in txt:
-        return False, "账号或密码错误"
+    # 仍被要求验证码（验证码错误等）
+    if "请输入验证码" in txt and "auth=" in txt:
+        return False, (msg or "验证码不正确，请重试"), txt
 
     # 权威校验：访问首页看 discuz_uid 是否为真实 UID
     logged, _ = verify_login(session)
     if logged:
-        return True, (msg or "登录成功")
+        return True, (msg or "登录成功"), txt
+    # 密码/用户名错误等明确失败
+    if msg and ("密码" in msg or "用户名" in msg):
+        return False, f"登录失败: {msg}", txt
+    return False, (msg or "登录失败（未进入登录态）"), txt
 
-    # 未能确认登录态——用论坛提示文案说明原因
-    if msg:
-        return False, f"登录失败: {msg}"
-    return False, f"登录失败（未进入登录态，响应前200字）: {txt[:200]}"
+
+def do_login(session, username, password):
+    """
+    账号密码登录（含新 IP 二次验证码挑战）。
+    成功返回 (True, 消息)，失败返回 (False, 消息)。
+    """
+    print("  [登录] 获取登录页 ...")
+    html, formhash, loginhash = fetch_login_page(session)
+    if not formhash or not loginhash:
+        return False, "无法解析登录页(formhash/loginhash 缺失)"
+
+    # 首次尝试：无验证码直接提交（老 IP / 已信任环境通常直接成功）
+    ok, msg, resp_html = _submit_login(
+        session, formhash, loginhash, username, password, None, None
+    )
+    if ok:
+        return True, msg
+
+    # 需要验证码挑战：从响应里取 auth 令牌
+    _, _, auth = extract_login_fields(resp_html) if resp_html else (None, None, None)
+    if not auth:
+        am = re.search(r"auth=([A-Za-z0-9%_]+)", resp_html or "")
+        auth = am.group(1) if am else None
+    if not auth:
+        return False, msg  # 真失败（密码错等），msg 已是原因
+
+    # 带 auth 重新拉挑战页，拿到最新的 formhash/loginhash/idhash
+    print("  [登录] 触发验证码挑战，重新获取挑战页 ...")
+    try:
+        r = session.get(
+            f"{BASE_URL}/member.php?mod=logging&action=login&auth={auth}",
+            timeout=TIMEOUT,
+            headers={"Referer": LOGIN_PAGE_URL},
+        )
+        chtml = get_page_text(r)
+    except requests.RequestException as e:
+        return False, f"获取挑战页异常: {e}"
+
+    cap = detect_captcha(chtml)
+    if not cap["needed"] or not cap["idhash"]:
+        return False, f"验证码挑战页未解析出验证码(idhash 缺失): {msg}"
+    c_fh, c_lh, _ = extract_login_fields(chtml)
+    if not c_fh or not c_lh:
+        return False, "验证码挑战页未解析出 formhash/loginhash"
+
+    # 二次提交：带 auth + 验证码（最多重试 3 次，应对 ddddocr 误识）
+    msg2 = "验证码识别失败"
+    for attempt in range(1, 4):
+        print(f"  [登录] 验证码 idhash={cap['idhash']}，ddddocr 识别中(第{attempt}次) ...")
+        code = solve_captcha(session, cap)
+        if not code:
+            return False, "验证码识别失败，请检查 ddddocr 或手动处理"
+        ok2, msg2, _ = _submit_login(
+            session, c_fh, c_lh, username, password, code, auth, cap["seccodehash"]
+        )
+        if ok2:
+            return True, (msg2 or "登录成功(已通过验证码)")
+        # 验证码不正确则换新图重试
+        if "验证码" in msg2 and ("不正确" in msg2 or "错误" in msg2):
+            print(f"  [登录] 第 {attempt} 次验证码不正确，换新图重试 ...")
+            continue
+        # 其他失败（如密码错）不再重试
+        return False, msg2
+    return False, msg2
 
 
 # ========================= 签到 =========================
