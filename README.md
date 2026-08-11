@@ -13,12 +13,25 @@
 | 功能 | 方法 / 地址 | 说明 |
 |------|------------|------|
 | 登录页 | `GET member.php?mod=logging&action=login` | 返回 `formhash`、`loginhash` |
-| 提交登录 | `POST member.php?mod=logging&action=login&loginsubmit=yes&loginhash={loginhash}` | 表单字段：`formhash` `username` `password` `questionid` `answer` `cookietime`；需要验证码时追加 `seccodeverify` `seccodehash` |
-| 验证码图片 | `GET misc.php?mod=seccode&update={rand}&idhash={idhash}` | 同一 session 拉取，提交时携带同一 `idhash` |
+| 提交登录（首次） | `POST member.php?mod=logging&action=login&loginsubmit=yes&loginhash={loginhash}` | 表单字段：`formhash` `username` `password` `questionid` `answer` `cookietime` |
+| 验证码校验 | `GET misc.php?mod=seccode&action=check&inajax=1&modid=member::logging&idhash={idhash}&secverify={code}` | 浏览器在最终提交前调用，校验验证码并在 cookie 写入 `seccode<idhash>` 标记 |
+| 提交登录（二次挑战） | `POST member.php?mod=logging&action=login&loginsubmit=yes&loginhash={loginhash}&inajax=1` | **新 IP 被要求验证码时**：凭据已由 `auth` 令牌关联，**不重发账号密码**；字段为 `formhash` `referer` `auth` `questionid` `answer` `seccodehash` `seccodemodid=member::logging` `seccodeverify` |
+| 验证码图片 | `GET misc.php?mod=seccode&update={rand}&idhash={idhash}` | 同一 session 拉取，**必须带同源 Referer**，否则被 WAF 返回 `Access Denied` |
 | 签到 | `GET plugin.php?id=fx_checkin:checkin&formhash={A}&{B}&inajax=1` | `fx_checkin` 插件，formhash 从首页 HTML 里 `fx_checkin:checkin&formhash=...` 提取 |
 
+### 新 IP 的「二次验证码挑战」流程（已实战验证）
+
+论坛按 **IP 信誉**动态决定是否要验证码。被判定为风险 IP（例如 GitHub Actions 的运行机）时，
+登录**提交之后**才下发"请输入验证码后继续登录" + 一个 `auth` 一次性令牌（藏在挑战页隐藏域 `name="auth"`）。
+脚本处理步骤：
+
+1. 首次 `POST` 提交账号密码（不带验证码）→ 被挑战，从响应取 `auth`；
+2. 带 `auth` 拉挑战页，解析出 `formhash` / `loginhash` / `idhash`；
+3. 拉取验证码图片（ddddocr 识别），先调 `action=check` 校验通过；
+4. 二次 `POST` 提交（`auth` + 验证码，**不重发账号密码**，URL 带 `inajax=1`）完成登录。
+
 > 验证码是**条件触发**的：登录过的 IP 不需要验证码，新 IP 登录才需要（与你的描述一致）。
-> 脚本对此做了**自适应**：登录页出现验证码字段就识别并提交；即使被服务端要求验证码也能重试。
+> 脚本对此做了**自适应**：登录页出现验证码字段就识别并提交；被服务端二次挑战也能自动走完上述流程。
 
 ---
 

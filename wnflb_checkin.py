@@ -297,30 +297,86 @@ def solve_captcha(session, cap):
     return None
 
 
-def _submit_login(session, formhash, loginhash, username, password,
-                  seccode, auth, seccodehash=""):
-    """执行一次登录 POST。返回 (ok, msg, resp_html)。"""
-    data = {
-        "formhash": formhash,
-        "referer": BASE_URL + "/",
-        "loginfield": "username",
-        "username": username,
-        "password": password,
-        "questionid": "0",
-        "answer": "",
-        "cookietime": "2592000",
-    }
-    if seccode:
-        data["seccodeverify"] = seccode
-        if seccodehash:
-            data["seccodehash"] = seccodehash
-    if auth:
-        data["auth"] = auth
+def verify_captcha_code(session, cap, code):
+    """
+    调用 Discuz 验证码校验接口（action=check）。
+    浏览器在最终提交登录前会先发这个请求：它会校验验证码是否正确，
+    并在 cookie 里写入 seccode<idhash> 标记（登录提交时服务端据此判定验证码已通过）。
+    返回 True/False，仅作提示用，不阻断后续登录提交。
+    """
+    url = (
+        f"{BASE_URL}/misc.php?mod=seccode&action=check&inajax=1"
+        f"&modid=member::logging&idhash={cap['idhash']}&secverify={code}"
+    )
+    try:
+        r = session.get(
+            url,
+            timeout=TIMEOUT,
+            headers={
+                "Referer": LOGIN_PAGE_URL,
+                "X-Requested-With": "XMLHttpRequest",
+            },
+        )
+        txt = get_page_text(r)
+        # 论坛返回 <root><![CDATA[succeed]]></root> 表示验证码正确
+        ok = "succeed" in txt
+        print(f"  [验证码] 校验接口返回: {txt[:80]!r} (ok={ok})")
+        return ok
+    except Exception as e:
+        print(f"  [验证码] 校验接口异常: {e}")
+        return False
+
+
+def _submit_login(session, formhash, loginhash, username="", password="",
+                  seccode="", auth="", seccodehash="", challenge=False,
+                  include_creds=False):
+    """
+    执行一次登录 POST。返回 (ok, msg, resp_html)。
+
+    challenge=True 时按 Discuz「二次验证码挑战」提交：
+      - 凭据已由第一次提交的 auth 令牌在服务端关联，无需重复发送账号密码
+      - 字段集对齐浏览器真实成功包：formhash/referer/auth/questionid/answer/
+        seccodehash/seccodemodid=member::logging/seccodeverify
+      - 登录 URL 带 &inajax=1
+    include_creds=True 时（挑战提交的兜底）额外带上 username/password。
+    """
+    if challenge:
+        data = {
+            "formhash": formhash,
+            "referer": BASE_URL + "/",
+            "auth": auth,
+            "questionid": "0",
+            "answer": "",
+            "seccodehash": seccodehash or "",
+            "seccodemodid": "member::logging",
+            "seccodeverify": seccode,
+        }
+        if include_creds:
+            data["loginfield"] = "username"
+            data["username"] = username
+            data["password"] = password
+    else:
+        data = {
+            "formhash": formhash,
+            "referer": BASE_URL + "/",
+            "loginfield": "username",
+            "username": username,
+            "password": password,
+            "questionid": "0",
+            "answer": "",
+            "cookietime": "2592000",
+        }
+        if seccode:
+            data["seccodeverify"] = seccode
+            if seccodehash:
+                data["seccodehash"] = seccodehash
 
     login_url = (
         f"{BASE_URL}/member.php?mod=logging&action=login"
         f"&loginsubmit=yes&loginhash={loginhash}"
     )
+    if challenge:
+        login_url += "&inajax=1"
     try:
         r = session.post(
             login_url,
@@ -334,6 +390,11 @@ def _submit_login(session, formhash, loginhash, username, password,
 
     txt = get_page_text(r)
     msg = extract_message(txt)
+    if not msg:
+        # inajax=1 时消息在 CDATA 里
+        cdata = re.search(r"<!\[CDATA\[(.*?)\]\]>", txt, re.DOTALL)
+        if cdata:
+            msg = re.sub(r"<[^>]+>", "", cdata.group(1)).strip()
 
     # 仍被要求验证码（验证码错误等）
     if "请输入验证码" in txt and "auth=" in txt:
@@ -366,42 +427,57 @@ def do_login(session, username, password):
     if ok:
         return True, msg
 
-    # 需要验证码挑战：从响应里取 auth 令牌
-    _, _, auth = extract_login_fields(resp_html) if resp_html else (None, None, None)
+    # 被验证码挑战：从第一次提交的响应里直接解析挑战页（auth 由本次响应给出，
+    # 不要再额外 GET 一次，否则 auth 可能失效）。
+    chtml = resp_html or ""
+    c_fh, c_lh, auth = extract_login_fields(chtml)
     if not auth:
-        am = re.search(r"auth=([A-Za-z0-9%_]+)", resp_html or "")
+        am = re.search(r"auth=([A-Za-z0-9%_]+)", chtml)
         auth = am.group(1) if am else None
     if not auth:
         return False, msg  # 真失败（密码错等），msg 已是原因
 
-    # 带 auth 重新拉挑战页，拿到最新的 formhash/loginhash/idhash
-    print("  [登录] 触发验证码挑战，重新获取挑战页 ...")
-    try:
-        r = session.get(
-            f"{BASE_URL}/member.php?mod=logging&action=login&auth={auth}",
-            timeout=TIMEOUT,
-            headers={"Referer": LOGIN_PAGE_URL},
-        )
-        chtml = get_page_text(r)
-    except requests.RequestException as e:
-        return False, f"获取挑战页异常: {e}"
-
+    # 若挑战页字段没解析全，带 auth 重新拉一次，并从页面里取最新的 auth
     cap = detect_captcha(chtml)
+    if not (c_fh and c_lh and cap["needed"] and cap["idhash"]):
+        print("  [登录] 触发验证码挑战，重新获取挑战页 ...")
+        try:
+            r = session.get(
+                f"{BASE_URL}/member.php?mod=logging&action=login&auth={auth}",
+                timeout=TIMEOUT,
+                headers={"Referer": LOGIN_PAGE_URL},
+            )
+            chtml = get_page_text(r)
+            c_fh, c_lh, c_auth = extract_login_fields(chtml)
+            if c_auth:
+                auth = c_auth
+            cap = detect_captcha(chtml)
+        except requests.RequestException as e:
+            return False, f"获取挑战页异常: {e}"
+
+    if not (c_fh and c_lh):
+        return False, "验证码挑战页未解析出 formhash/loginhash"
     if not cap["needed"] or not cap["idhash"]:
         return False, f"验证码挑战页未解析出验证码(idhash 缺失): {msg}"
-    c_fh, c_lh, _ = extract_login_fields(chtml)
-    if not c_fh or not c_lh:
-        return False, "验证码挑战页未解析出 formhash/loginhash"
 
-    # 二次提交：带 auth + 验证码（最多重试 3 次，应对 ddddocr 误识）
+    # 二次提交：先校验验证码（action=check 写 seccode cookie）-> 带 auth 提交
+    # （不带账号密码，凭据由 auth 关联；若因凭据缺失失败则带凭据兜底重试一次）
     msg2 = "验证码识别失败"
     for attempt in range(1, 4):
         print(f"  [登录] 验证码 idhash={cap['idhash']}，ddddocr 识别中(第{attempt}次) ...")
         code = solve_captcha(session, cap)
         if not code:
             return False, "验证码识别失败，请检查 ddddocr 或手动处理"
+
+        # 调用验证码校验接口（设置 seccode cookie，确认识别是否正确）
+        vok = verify_captcha_code(session, cap, code)
+        if not vok:
+            print(f"  [登录] 第 {attempt} 次验证码校验未通过，换新图重试 ...")
+            continue
+
         ok2, msg2, _ = _submit_login(
-            session, c_fh, c_lh, username, password, code, auth, cap["seccodehash"]
+            session, c_fh, c_lh, username, password, code, auth,
+            cap["seccodehash"], challenge=True,
         )
         if ok2:
             return True, (msg2 or "登录成功(已通过验证码)")
@@ -409,7 +485,16 @@ def do_login(session, username, password):
         if "验证码" in msg2 and ("不正确" in msg2 or "错误" in msg2):
             print(f"  [登录] 第 {attempt} 次验证码不正确，换新图重试 ...")
             continue
-        # 其他失败（如密码错）不再重试
+        # 若因凭据缺失失败（如"密码空"），带账号密码兜底重试一次
+        if "密码" in msg2 or "用户名" in msg2:
+            print(f"  [登录] 第 {attempt} 次疑似凭据缺失，带账号密码兜底重试 ...")
+            ok2, msg2, _ = _submit_login(
+                session, c_fh, c_lh, username, password, code, auth,
+                cap["seccodehash"], challenge=True, include_creds=True,
+            )
+            if ok2:
+                return True, (msg2 or "登录成功(已通过验证码)")
+        # 其他失败不再重试
         return False, msg2
     return False, msg2
 
