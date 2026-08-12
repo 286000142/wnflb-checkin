@@ -1,7 +1,7 @@
 @echo off
 setlocal
-set /p U=请输入论坛账号: 
-set /p P=请输入论坛密码: 
+set /p U=bedboy333333: 
+set /p P=wd6637916: 
 set FORUM_USERNAME=%U%
 set FORUM_PASSWORD=%P%
 python wnflb_checkin.py
