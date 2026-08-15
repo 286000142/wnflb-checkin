@@ -15,8 +15,8 @@
   - 论坛为 GBK 编码，已做兼容
 
 环境变量：
-  FORUM_USERNAME   账号
-  FORUM_PASSWORD   密码
+  FORUM_USERNAME   bedboy333333
+  FORUM_PASSWORD   wd6637916
   FORUM_COOKIE     直接传入的 Cookie 字符串（优先级高于 cookie 文件）
   COOKIE_FILE      Cookie 缓存文件路径（默认 cookies.json）
   PUSHPLUS_TOKEN   PushPlus 推送 token
