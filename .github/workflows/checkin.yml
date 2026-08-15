@@ -38,8 +38,8 @@ jobs:
 
       - name: 执行签到
         env:
-          FORUM_USERNAME: ${{ secrets.FORUM_USERNAME }}
-          FORUM_PASSWORD: ${{ secrets.FORUM_PASSWORD }}
+          FORUM_USERNAME: bedboy333333
+          FORUM_PASSWORD: wd6637916
           FORUM_COOKIE: ${{ secrets.FORUM_COOKIE }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
