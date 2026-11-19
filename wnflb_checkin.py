@@ -259,6 +259,21 @@ def extract_login_fields(html):
     )
 
 
+def _is_image_bytes(data):
+    """PNG / JPEG / GIF / WebP 魔数检测（Discuz seccode 可能是任一种）。"""
+    if not data or len(data) < 12:
+        return False
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True
+    if data.startswith(b"\xff\xd8\xff"):
+        return True
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return True
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return True
+    return False
+
+
 def solve_captcha(session, cap):
     """
     拉取验证码图片并用 ddddocr 识别。
@@ -274,7 +289,7 @@ def solve_captcha(session, cap):
     ocr = ddddocr.DdddOcr(show_ad=False)
     # 论坛/WAF 对 seccode 图片接口要求同源 Referer，否则返回 Access Denied
     headers = {"Referer": LOGIN_PAGE_URL}
-    for attempt in range(1, 4):
+    for attempt in range(1, 6):
         try:
             update = str(int(time.time() * 1000))
             img_url = (
@@ -282,14 +297,22 @@ def solve_captcha(session, cap):
                 f"&update={update}&idhash={cap['idhash']}"
             )
             r = session.get(img_url, timeout=TIMEOUT, headers=headers)
-            # 校验确实是图片（PNG/JPEG 魔数），避免把 Access Denied 当图片识别
-            if r.status_code != 200 or len(r.content) < 100:
-                print(f"  [验证码] 第 {attempt} 次拉取图片失败(status={r.status_code}, len={len(r.content)})")
+            if r.status_code != 200 or len(r.content) < 50:
+                print(
+                    f"  [验证码] 第 {attempt} 次拉取图片失败"
+                    f"(status={r.status_code}, len={len(r.content)})"
+                )
                 continue
-            if r.content[:4] not in (b"\x89PNG", b"\xff\xd8\xff\xe0", b"\xff\xd8\xff\xe1"):
-                print(f"  [验证码] 第 {attempt} 次返回非图片(可能被拦截), len={len(r.content)}")
+            if not _is_image_bytes(r.content):
+                ctype = (r.headers.get("Content-Type") or "").lower()
+                print(
+                    f"  [验证码] 第 {attempt} 次返回非图片"
+                    f"(ctype={ctype!r}, len={len(r.content)}, head={r.content[:16]!r})"
+                )
                 continue
             code = ocr.classification(r.content).strip()
+            # Discuz 常见 4 位字母数字；去掉 OCR 噪声空格
+            code = re.sub(r"\s+", "", code)
             print(f"  [验证码] 第 {attempt} 次识别结果: {code!r}")
             if code:
                 return code
@@ -364,9 +387,10 @@ def _submit_login(session, formhash, loginhash, username="", password="",
             "cookietime": "2592000",
         }
         if seccode:
+            # 首屏验证码提交必须带 seccodemodid，否则 Discuz 直接报「验证码填写错误」
             data["seccodeverify"] = seccode
-            if seccodehash:
-                data["seccodehash"] = seccodehash
+            data["seccodehash"] = seccodehash or ""
+            data["seccodemodid"] = "member::logging"
 
     login_url = (
         f"{BASE_URL}/member.php?mod=logging&action=login"
@@ -407,38 +431,57 @@ def _submit_login(session, formhash, loginhash, username="", password="",
     return False, (msg or "登录失败（未进入登录态）"), txt
 
 
-def do_login(session, username, password):
-    """
-    账号密码登录（含新 IP 二次验证码挑战）。
-    成功返回 (True, 消息)，失败返回 (False, 消息)。
-    """
-    print("  [登录] 获取登录页 ...")
-    html, formhash, loginhash = fetch_login_page(session)
-    if not formhash or not loginhash:
-        return False, "无法解析登录页(formhash/loginhash 缺失)"
-
-    # 首次尝试：无验证码直接提交（老 IP / 已信任环境通常直接成功）
-    ok, msg, resp_html = _submit_login(
-        session, formhash, loginhash, username, password, None, None
+def _is_captcha_error(msg):
+    msg = msg or ""
+    return ("验证码" in msg) and (
+        "错误" in msg or "不正确" in msg or "填写" in msg or "输入" in msg
     )
-    if ok:
-        return True, msg
 
-    # 被验证码挑战：从第一次提交的响应里直接解析挑战页（auth 由本次响应给出）。
-    # 关键：auth 在 HTML 里可能以 %2F 形式存在（含 /），需先 unquote 还原，
-    # 再交给 _submit_login 统一按 form-urlencoded 编码，否则会被二次编码导致
-    # 服务端认不出令牌、报“密码空或包含非法字符”。
-    chtml = resp_html or ""
-    c_fh, c_lh, auth = extract_login_fields(chtml)
-    auth = urllib.parse.unquote(auth) if auth else None
-    if not auth:
-        am = re.search(r"auth=([A-Za-z0-9%_./=+]+)", chtml)
-        auth = urllib.parse.unquote(am.group(1)) if am else None
-    if not auth:
-        return False, msg  # 真失败（密码错等），msg 已是原因
 
-    # 若挑战页字段没解析全，带 auth 重新拉一次，并从页面里取最新的 auth（同样 unquote）
+def _try_login_with_page_captcha(session, formhash, loginhash, username, password, cap):
+    """
+    登录页首屏已带验证码时：OCR → check → 带账号密码+seccode 提交。
+    最多 5 次换图。返回 (ok, msg)。
+    """
+    last_msg = "验证码识别失败"
+    for attempt in range(1, 6):
+        print(f"  [登录] 首屏验证码 idhash={cap['idhash']}，ddddocr 识别中(第{attempt}次) ...")
+        code = solve_captcha(session, cap)
+        if not code:
+            last_msg = "验证码识别失败，请检查 ddddocr 或手动处理"
+            continue
+        if not verify_captcha_code(session, cap, code):
+            print(f"  [登录] 第 {attempt} 次验证码校验未通过，换新图重试 ...")
+            continue
+        ok, last_msg, _ = _submit_login(
+            session, formhash, loginhash, username, password,
+            code, "", cap["seccodehash"], challenge=False,
+        )
+        if ok:
+            return True, (last_msg or "登录成功(首屏验证码)")
+        if _is_captcha_error(last_msg):
+            print(f"  [登录] 第 {attempt} 次验证码不正确，换新图重试 ...")
+            # 换图前重新拉登录页，刷新 formhash/idhash
+            html, fh, lh = fetch_login_page(session)
+            if fh and lh:
+                formhash, loginhash = fh, lh
+                cap = detect_captcha(html)
+                if not (cap.get("needed") and cap.get("idhash")):
+                    return False, last_msg
+            continue
+        return False, last_msg
+    return False, last_msg
+
+
+def _try_login_with_auth_challenge(session, username, password, chtml, auth, first_msg):
+    """
+    新 IP 二次验证码挑战：凭 auth 关联凭据，只提交 seccode。
+    返回 (ok, msg)。
+    """
+    c_fh, c_lh, c_auth = extract_login_fields(chtml)
+    auth = urllib.parse.unquote(c_auth) if c_auth else auth
     cap = detect_captcha(chtml)
+
     if not (c_fh and c_lh and cap["needed"] and cap["idhash"]):
         print("  [登录] 触发验证码挑战，重新获取挑战页 ...")
         try:
@@ -458,25 +501,21 @@ def do_login(session, username, password):
     if not (c_fh and c_lh):
         return False, "验证码挑战页未解析出 formhash/loginhash"
     if not cap["needed"] or not cap["idhash"]:
-        # 调试：把挑战页里和验证码相关的片段打出来，便于排查页面结构变化
         dbg = re.findall(r".{0,40}seccode.{0,60}", chtml, re.I)
         if not dbg:
             dbg = re.findall(r".{0,30}updateseccode.{0,60}", chtml, re.I)
         print("  [调试] 挑战页未匹配到 seccode 标记，相关片段:")
         for d in dbg[:5]:
             print("    ", d.strip()[:120])
-        return False, f"验证码挑战页未解析出验证码(idhash 缺失): {msg}"
+        return False, f"验证码挑战页未解析出验证码(idhash 缺失): {first_msg}"
 
-    # 二次挑战提交（不带账号密码，凭据由 auth 关联）。最多 3 次换图重试；
-    # 若仍报凭据缺失（auth 失效 / 编码问题），则重拉挑战页拿新 auth 再试。
     last_msg = "验证码识别失败"
-    for attempt in range(1, 4):
-        print(f"  [登录] 验证码 idhash={cap['idhash']}，ddddocr 识别中(第{attempt}次) ...")
+    for attempt in range(1, 6):
+        print(f"  [登录] 挑战验证码 idhash={cap['idhash']}，ddddocr 识别中(第{attempt}次) ...")
         code = solve_captcha(session, cap)
         if not code:
             return False, "验证码识别失败，请检查 ddddocr 或手动处理"
 
-        # 调用验证码校验接口（设置 seccode cookie，确认识别是否正确）
         if not verify_captcha_code(session, cap, code):
             print(f"  [登录] 第 {attempt} 次验证码校验未通过，换新图重试 ...")
             continue
@@ -487,11 +526,9 @@ def do_login(session, username, password):
         )
         if ok2:
             return True, (last_msg or "登录成功(已通过验证码)")
-        # 验证码不正确则换新图重试
-        if "验证码" in last_msg and ("不正确" in last_msg or "错误" in last_msg):
+        if _is_captcha_error(last_msg):
             print(f"  [登录] 第 {attempt} 次验证码不正确，换新图重试 ...")
             continue
-        # 凭据缺失（auth 失效）：重拉挑战页获取新 auth 重试一次
         if "密码" in last_msg or "用户名" in last_msg:
             print(f"  [登录] 第 {attempt} 次疑似凭据缺失，重拉挑战页重试 ...")
             try:
@@ -507,9 +544,67 @@ def do_login(session, username, password):
             except requests.RequestException:
                 pass
             continue
-        # 其他失败不再重试
         return False, last_msg
     return False, last_msg
+
+
+def do_login(session, username, password):
+    """
+    账号密码登录：
+      1) 登录页首屏若已有验证码 → OCR 后直接带码提交
+      2) 否则先无码提交；若触发新 IP 二次挑战（带 auth）→ OCR 再提交
+      3) 若无码提交直接报「验证码填写错误」且无 auth → 重拉登录页走首屏验证码
+    """
+    print("  [登录] 获取登录页 ...")
+    html, formhash, loginhash = fetch_login_page(session)
+    if not formhash or not loginhash:
+        return False, "无法解析登录页(formhash/loginhash 缺失)"
+
+    cap0 = detect_captcha(html)
+    if cap0.get("needed") and cap0.get("idhash"):
+        print(f"  [登录] 登录页已要求验证码 (idhash={cap0['idhash']})")
+        return _try_login_with_page_captcha(
+            session, formhash, loginhash, username, password, cap0
+        )
+
+    # 首次尝试：无验证码直接提交（老 IP / 已信任环境通常直接成功）
+    ok, msg, resp_html = _submit_login(
+        session, formhash, loginhash, username, password, None, None
+    )
+    if ok:
+        return True, msg
+
+    chtml = resp_html or ""
+    c_fh, c_lh, auth = extract_login_fields(chtml)
+    auth = urllib.parse.unquote(auth) if auth else None
+    if not auth:
+        am = re.search(r"auth=([A-Za-z0-9%_./=+]+)", chtml)
+        auth = urllib.parse.unquote(am.group(1)) if am else None
+
+    if auth:
+        return _try_login_with_auth_challenge(
+            session, username, password, chtml, auth, msg
+        )
+
+    # GitHub Actions 新 IP 常见：空码提交直接回「验证码填写错误」且不给 auth。
+    # 重拉登录页，走首屏验证码 OCR。
+    if _is_captcha_error(msg):
+        print("  [登录] 空码提交被拒，重新获取带验证码的登录页 ...")
+        html, formhash, loginhash = fetch_login_page(session)
+        if not formhash or not loginhash:
+            return False, msg
+        cap = detect_captcha(html)
+        if cap.get("needed") and cap.get("idhash"):
+            return _try_login_with_page_captcha(
+                session, formhash, loginhash, username, password, cap
+            )
+        print("  [调试] 重拉登录页仍无验证码标记")
+        dbg = re.findall(r".{0,40}seccode.{0,60}", html, re.I)
+        for d in dbg[:5]:
+            print("    ", d.strip()[:120])
+        return False, msg
+
+    return False, msg
 
 
 # ========================= 签到 =========================

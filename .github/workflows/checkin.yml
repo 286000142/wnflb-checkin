@@ -24,7 +24,10 @@ jobs:
           python-version: "3.11"
 
       - name: 安装依赖
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -c "import ddddocr; print('ddddocr OK', ddddocr.__version__ if hasattr(ddddocr,'__version__') else 'ok')"
 
       - name: 恢复 Cookie 缓存
         uses: actions/cache@v4
