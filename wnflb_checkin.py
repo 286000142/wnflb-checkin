@@ -77,9 +77,27 @@ def cookies_to_header(session):
 
 
 def get_page_text(resp):
-    """优先按 GBK 解码（论坛是 GBK）"""
-    if resp.encoding and resp.encoding.lower() in ("gbk", "gb2312", "gb18030"):
-        return resp.text
+    """按 Content-Type / meta charset 解码；论坛已切 UTF-8，兼容旧 GBK。
+
+    注意：UTF-8 字节用 GBK 硬解常常不抛错、只产生乱码，故不可再默认先 GBK。
+    """
+    ctype = (resp.headers.get("Content-Type") or "").lower()
+    head = resp.content[:1200]
+    explicit_gbk = (
+        "gbk" in ctype
+        or "gb2312" in ctype
+        or "gb18030" in ctype
+        or bool(re.search(br"charset\s*=\s*[\"']?gbk|gb2312|gb18030", head, re.I))
+    )
+    if explicit_gbk:
+        try:
+            return resp.content.decode("gbk")
+        except UnicodeDecodeError:
+            pass
+    try:
+        return resp.content.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
     try:
         return resp.content.decode("gbk")
     except (UnicodeDecodeError, LookupError):
@@ -421,13 +439,28 @@ def _submit_login(session, formhash, loginhash, username="", password="",
     if "请输入验证码" in txt and "auth=" in txt:
         return False, (msg or "验证码不正确，请重试"), txt
 
-    # 权威校验：访问首页看 discuz_uid 是否为真实 UID
-    logged, _ = verify_login(session)
-    if logged:
+    login_ok_hint = _looks_like_login_success(txt, msg)
+
+    # 权威校验：访问首页看 discuz_uid 是否为真实 UID（成功页后偶发需重试）
+    for _try in range(3):
+        logged, _ = verify_login(session)
+        if logged:
+            return True, (msg or "登录成功"), txt
+        if not login_ok_hint:
+            break
+        time.sleep(1)
+
+    # Actions 上偶发：成功页 + 已下发 auth，但紧接着首页仍读成游客。
+    # 此时信任 auth，交给后续签到请求再校验。
+    if login_ok_hint and has_auth_cookie(session):
+        print("  [登录] 首页校验未通过，但已持有 auth Cookie，继续")
         return True, (msg or "登录成功"), txt
+
     # 密码/用户名错误等明确失败
-    if msg and ("密码" in msg or "用户名" in msg):
+    if msg and ("密码" in msg or "用户名" in msg) and not login_ok_hint:
         return False, f"登录失败: {msg}", txt
+    if login_ok_hint:
+        return False, "登录响应成功但首页未进入登录态（Cookie 可能被旧缓存污染）", txt
     return False, (msg or "登录失败（未进入登录态）"), txt
 
 
@@ -436,6 +469,30 @@ def _is_captcha_error(msg):
     return ("验证码" in msg) and (
         "错误" in msg or "不正确" in msg or "填写" in msg or "输入" in msg
     )
+
+
+def _looks_like_login_success(txt, msg=""):
+    """Discuz 登录成功页特征（含编码异常时的 ASCII 标记）。"""
+    blob = f"{txt or ''}\n{msg or ''}"
+    if "main_succeed" in blob or "succeedlocation" in blob:
+        return True
+    if "succeedmessage" in blob and "window.location.href" in blob:
+        return True
+    if "欢迎" in blob and ("回来" in blob or "登录" in blob):
+        return True
+    if "登录成功" in blob:
+        return True
+    return False
+
+
+def has_auth_cookie(session):
+    """登录成功后 Discuz 会下发 *_auth；有则可视为已持有登录凭证。"""
+    for c in session.cookies:
+        name = c.name or ""
+        val = c.value or ""
+        if name.endswith("_auth") and len(val) > 8:
+            return True
+    return False
 
 
 def _try_login_with_page_captcha(session, formhash, loginhash, username, password, cap):
@@ -764,7 +821,10 @@ def main():
             print(f"[FAIL] {msg}")
             send_notification("[签到失败] 需登录", f"时间:{now}\n错误:{msg}")
             sys.exit(1)
-        print("[2] 使用账号密码登录 ...")
+        # 过期 Cookie 若留在 jar 里，登录 Set-Cookie 会与旧 auth 并存，
+        # Discuz 可能仍按旧凭证判游客 → Actions 上表现为「成功页但未登录」。
+        session.cookies.clear()
+        print("[2] 使用账号密码登录（已清空过期 Cookie）...")
         ok, msg = do_login(session, args.username, args.password)
         if not ok:
             print(f"[FAIL] 登录失败: {msg}")
@@ -777,8 +837,18 @@ def main():
             print(f"  [Cookie] 字符串: {cookies_to_header(session)}")
         logged, html = verify_login(session)
         if not logged:
-            print("[FAIL] 登录后首页校验未通过")
-            sys.exit(1)
+            # 再拉一次；若仍失败但有 auth，用当前首页 HTML 继续试签到
+            time.sleep(1)
+            logged, html = verify_login(session)
+        if not logged:
+            if has_auth_cookie(session):
+                print("  [警告] 首页仍显示未登录，但持有 auth，尝试继续签到")
+                if not html:
+                    resp = fetch_forum(session)
+                    html = get_page_text(resp) if resp is not None else ""
+            else:
+                print("[FAIL] 登录后首页校验未通过")
+                sys.exit(1)
 
     # 3) 签到
     print("[3] 检查签到状态 ...")

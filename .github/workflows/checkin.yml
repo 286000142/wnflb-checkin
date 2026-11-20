@@ -35,9 +35,12 @@ jobs:
           path: cookies.json
           # 用 run_id 作 key，每次都是新 key → 结束时 cache 的 save 步骤总会写入最新 cookie
           # restore-keys 用前缀匹配，自动恢复上一次 run 缓存的 cookie（跨 run 复用）
-          key: wnflb-cookies-${{ github.run_id }}
+          # v2：作废 11 月中旬起反复复用的过期 cookie 缓存前缀
+          key: wnflb-cookies-v2-${{ github.run_id }}
           restore-keys: |
-            wnflb-cookies-
+            wnflb-cookies-v2-
+          # 登录成功但后续步骤失败时也要写入新 cookie，避免反复复用过期缓存
+          save-always: true
 
       - name: 执行签到
         env:
